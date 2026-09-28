@@ -177,7 +177,6 @@ func TestLeafTestDurations(t *testing.T) {
 		"TestSuite/TestFlaky":       7,
 	}, LeafTestDurations(cases))
 }
-
 func TestExtractReportsFromZip(t *testing.T) {
 	zipPath := filepath.Join(t.TempDir(), "artifact.zip")
 	zipFile, err := os.Create(zipPath)
