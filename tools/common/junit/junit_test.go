@@ -1,6 +1,7 @@
 package junit
 
 import (
+	"archive/zip"
 	"encoding/xml"
 	"os"
 	"path/filepath"
@@ -175,4 +176,35 @@ func TestLeafTestDurations(t *testing.T) {
 		"TestSuite/TestDeep/case-b": 3,
 		"TestSuite/TestFlaky":       7,
 	}, LeafTestDurations(cases))
+}
+func TestExtractReportsFromZip(t *testing.T) {
+	zipPath := filepath.Join(t.TempDir(), "artifact.zip")
+	zipFile, err := os.Create(zipPath)
+	require.NoError(t, err)
+	writer := zip.NewWriter(zipFile)
+	for name, content := range map[string]string{
+		"reports/one.xml": "one",
+		"two.XML":         "two",
+		"ignored.txt":     "ignored",
+	} {
+		file, err := writer.Create(name)
+		require.NoError(t, err)
+		_, err = file.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	require.NoError(t, zipFile.Close())
+
+	outputDir := t.TempDir()
+	paths, err := ExtractReportsFromZip(zipPath, outputDir)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{
+		filepath.Join(outputDir, "one.xml"),
+		filepath.Join(outputDir, "two.XML"),
+	}, paths)
+	one, err := os.ReadFile(filepath.Join(outputDir, "one.xml"))
+	require.NoError(t, err)
+	require.Equal(t, "one", string(one))
+	_, err = os.Stat(filepath.Join(outputDir, "ignored.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
