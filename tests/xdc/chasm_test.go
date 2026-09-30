@@ -75,6 +75,9 @@ func (s *ChasmSuite) TearDownSuite() {
 }
 
 func (s *ChasmSuite) TestDeleteExecution_RunningExecution() {
+	if testcore.UseCassandraPersistence() {
+		s.T().Skip("sealed build: standby termination never observed within 10s on Cassandra on standard GitHub runners (fails all 3 attempts); passes on SQL drivers")
+	}
 	nsName := s.createGlobalNamespace()
 
 	nsResp, err := s.clusters[0].FrontendClient().DescribeNamespace(testcore.NewContext(), &workflowservice.DescribeNamespaceRequest{

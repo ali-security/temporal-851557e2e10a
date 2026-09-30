@@ -388,8 +388,11 @@ func (s *QueryWorkflowSuite) TestQueryWorkflow_NonStickyMultiPageHistory() {
 			Namespace: s.Namespace().String(),
 			Execution: &commonpb.WorkflowExecution{WorkflowId: id},
 		})
-		return err == nil && resp.GetWorkflowExecutionInfo().GetHistoryLength() > 10
-	}, 10*time.Second, 200*time.Millisecond)
+		// sealed build: also require no pending activity / workflow task, so the worker is not stopped
+		// mid-flight and the manual poll below cannot pick up a regular workflow task instead of the query task.
+		return err == nil && resp.GetWorkflowExecutionInfo().GetHistoryLength() > 10 &&
+			len(resp.GetPendingActivities()) == 0 && resp.GetPendingWorkflowTask() == nil
+	}, 15*time.Second, 200*time.Millisecond)
 
 	// Stop worker to clear sticky cache so the query goes through non-sticky path.
 	queryWorker.Stop()

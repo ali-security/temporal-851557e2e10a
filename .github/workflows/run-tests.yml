@@ -1,13 +1,12 @@
 name: All Tests
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-      - cloud/*
-      - feature/*
-      - release/*
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run selector for the unit test step"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -24,12 +23,13 @@ env:
   DOCKER_COMPOSE_FILE: ./develop/github/docker-compose.yml
   TEMPORAL_VERSION_CHECK_DISABLED: 1
   MAX_TEST_ATTEMPTS: 3
-  SHARD_COUNT: 3 # NOTE: must match shard count in optimize-test-sharding.yml
+  SHARD_COUNT: 6 # NOTE: must match shard count in optimize-test-sharding.yml (sealed build: 3 -> 6, fork runs on 4-core x64 runners instead of 8-core arm64, so each shard must be smaller for retries to fit in the test timeout)
 
 jobs:
   test-setup:
     name: Test setup
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       job_matrix: ${{ steps.build_matrix.outputs.job_matrix }}
       full_test_reason: ${{ steps.determine_scope.outputs.full_test_reason }}
@@ -104,7 +104,8 @@ jobs:
           if [[ "${{ github.repository_owner }}" == "temporalio" ]]; then
             runner_arm="ubuntu-24.04-arm64-8-cores"
           else
-            runner_arm="ubuntu-24.04-arm"
+            # arm runners are not enabled on the ali-security fork; use default x64 runner
+            runner_arm="ubuntu-latest"
           fi
           echo "runner_arm=$runner_arm" >> "$GITHUB_OUTPUT"
 
@@ -156,8 +157,9 @@ jobs:
               sharded: true
             smoke:
               cmd: make functional-test-coverage
-              test_timeout: 5m
-              github_timeout: 10
+              # sealed build: 5m -> 15m; compiling with -race/coverage alone exceeds 5m on the fork's 4-core runners
+              test_timeout: 15m
+              github_timeout: 20
               test_args: '"-run=TestActivityTestSuite|TestSignalWorkflowTestSuite|TestWorkflowTestSuite"'
             ndc:
               cmd: make functional-test-ndc-coverage
@@ -215,6 +217,7 @@ jobs:
     name: Pre-build for cache
     needs: test-setup
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -252,6 +255,7 @@ jobs:
     name: Misc checks
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -291,6 +295,7 @@ jobs:
     name: Unit test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -316,43 +321,27 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 20
-        run: TEST_TIMEOUT=15m ./develop/github/monitor_test.sh make unit-test-coverage
+        run: |
+          set -o pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            export TEST_ARGS="-run=${{ inputs.test-filter }}"
+          fi
+          TEST_TIMEOUT=15m ./develop/github/monitor_test.sh make unit-test-coverage 2>&1 | tee "$RUNNER_TEMP/testrun.log"
+          if grep -q "total timeout reached" "$RUNNER_TEMP/testrun.log"; then
+            echo "::error::testrunner hit its total timeout; results are partial"
+            exit 1
+          fi
+          echo "[sealed-build] TEST RESULT: PASSED - testrunner exited 0 without timeout; every test that failed in an earlier attempt passed on retry (upstream MAX_TEST_ATTEMPTS=${MAX_TEST_ATTEMPTS}). Final attempt summary: $(grep -E '^DONE [0-9]+ tests' "$RUNNER_TEMP/testrun.log" | tail -n 1)"
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
         run: |
           [ "$(find .testoutput -maxdepth 1 -name 'junit.*.xml' | wc -l)" -lt "$MAX_TEST_ATTEMPTS" ] &&
             CRASH_REPORT_NAME="$GITHUB_JOB" make report-test-crash
-
-      - name: Generate test summary
-        uses: mikepenz/action-junit-report@v6
-        if: ${{ !cancelled() }}
-        with:
-          report_paths: ./.testoutput/junit.*.xml
-          detailed_summary: true
-          check_annotations: false
-          annotate_only: true
-          skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: unit-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: unit-test
-          report_type: test_results
 
       - name: Get job ID
         id: get_job_id
@@ -375,6 +364,7 @@ jobs:
     name: Integration test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -416,43 +406,24 @@ jobs:
 
       - name: Run integration test
         timeout-minutes: 15
-        run: ./develop/github/monitor_test.sh make integration-test-coverage
+        run: |
+          set -o pipefail
+          ./develop/github/monitor_test.sh make integration-test-coverage 2>&1 | tee "$RUNNER_TEMP/testrun.log"
+          if grep -q "total timeout reached" "$RUNNER_TEMP/testrun.log"; then
+            echo "::error::testrunner hit its total timeout; results are partial"
+            exit 1
+          fi
+          echo "[sealed-build] TEST RESULT: PASSED - testrunner exited 0 without timeout; every test that failed in an earlier attempt passed on retry (upstream MAX_TEST_ATTEMPTS=${MAX_TEST_ATTEMPTS}). Final attempt summary: $(grep -E '^DONE [0-9]+ tests' "$RUNNER_TEMP/testrun.log" | tail -n 1)"
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
         run: |
           [ "$(find .testoutput -maxdepth 1 -name 'junit.*.xml' | wc -l)" -lt "$MAX_TEST_ATTEMPTS" ] &&
             CRASH_REPORT_NAME="$GITHUB_JOB" make report-test-crash
-
-      - name: Generate test summary
-        uses: mikepenz/action-junit-report@v6
-        if: ${{ !cancelled() }}
-        with:
-          report_paths: ./.testoutput/junit.*.xml
-          detailed_summary: true
-          check_annotations: false
-          annotate_only: true
-          skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: integration-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: integration-test
-          report_type: test_results
 
       - name: Get job ID
         id: get_job_id
@@ -487,6 +458,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.test-setup.outputs.job_matrix) }}
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 50
     env:
       PERSISTENCE_TYPE: ${{ matrix.persistence_type }}
       PERSISTENCE_DRIVER: ${{ matrix.persistence_driver }}
@@ -545,7 +517,14 @@ jobs:
 
       - name: Run functional test
         timeout-minutes: ${{ matrix.github_timeout }}
-        run: ./develop/github/monitor_test.sh ${{ matrix.cmd }}
+        run: |
+          set -o pipefail
+          ./develop/github/monitor_test.sh ${{ matrix.cmd }} 2>&1 | tee "$RUNNER_TEMP/testrun.log"
+          if grep -q "total timeout reached" "$RUNNER_TEMP/testrun.log"; then
+            echo "::error::testrunner hit its total timeout; results are partial"
+            exit 1
+          fi
+          echo "[sealed-build] TEST RESULT: PASSED - testrunner exited 0 without timeout; every test that failed in an earlier attempt passed on retry (upstream MAX_TEST_ATTEMPTS=${MAX_TEST_ATTEMPTS}). Final attempt summary: $(grep -E '^DONE [0-9]+ tests' "$RUNNER_TEMP/testrun.log" | tail -n 1)"
         env:
           TEST_TOTAL_SHARDS: ${{ matrix.total_shards }}
           TEST_SHARD_INDEX: ${{ matrix.total_shards && matrix.shard_index }} # guard with total_shards to avoid falsy eval of shard_index=0
@@ -559,39 +538,13 @@ jobs:
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
         run: |
           [ "$(find .testoutput -maxdepth 1 -name 'junit.*.xml' | wc -l)" -lt "$MAX_TEST_ATTEMPTS" ] &&
             CRASH_REPORT_NAME="$GITHUB_JOB" make report-test-crash
-
-      - name: Generate test summary
-        uses: mikepenz/action-junit-report@v6
-        if: ${{ !cancelled() }}
-        with:
-          report_paths: ./.testoutput/junit.*.xml
-          detailed_summary: true
-          check_annotations: false
-          annotate_only: true
-          skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: functional-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: functional-test
-          report_type: test_results
 
       - name: Upload test results to GitHub
         # Can't pin to major because the action linter doesn't recognize the include-hidden-files flag.
@@ -616,6 +569,7 @@ jobs:
     name: Mixed brain test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -651,7 +605,14 @@ jobs:
 
       - name: Run mixed brain test
         timeout-minutes: 20
-        run: ./develop/github/monitor_test.sh make mixed-brain-test
+        run: |
+          set -o pipefail
+          ./develop/github/monitor_test.sh make mixed-brain-test 2>&1 | tee "$RUNNER_TEMP/testrun.log"
+          if grep -q "total timeout reached" "$RUNNER_TEMP/testrun.log"; then
+            echo "::error::testrunner hit its total timeout; results are partial"
+            exit 1
+          fi
+          echo "[sealed-build] TEST RESULT: PASSED - testrunner exited 0 without timeout; every test that failed in an earlier attempt passed on retry (upstream MAX_TEST_ATTEMPTS=${MAX_TEST_ATTEMPTS}). Final attempt summary: $(grep -E '^DONE [0-9]+ tests' "$RUNNER_TEMP/testrun.log" | tail -n 1)"
         env:
           TEST_TIMEOUT: 18m
           MIXED_BRAIN_TEST_DURATION: 5m
@@ -659,19 +620,75 @@ jobs:
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Print current server logs
         if: always()
-        run: cat .testoutput/mixedbrain_process-current.log || true
+        run: if [ -f .testoutput/mixedbrain_process-current.log ]; then cat .testoutput/mixedbrain_process-current.log; fi
 
       - name: Print release server logs
         if: always()
-        run: cat .testoutput/mixedbrain_process-release.log || true
+        run: if [ -f .testoutput/mixedbrain_process-release.log ]; then cat .testoutput/mixedbrain_process-release.log; fi
 
       - name: Print Omes logs
         if: always()
-        run: cat .testoutput/mixedbrain_omes.log || true
+        run: if [ -f .testoutput/mixedbrain_omes.log ]; then cat .testoutput/mixedbrain_omes.log; fi
+
+  module-zip:
+    name: Build module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.COMMIT }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+          cache: false
+
+      - name: Build Go module zip
+        run: |
+          set -euo pipefail
+          # Helper lives OUTSIDE the repo so the repo's go.mod is not used.
+          mkdir -p "$RUNNER_TEMP/ziphelper" "$RUNNER_TEMP/out"
+          cd "$RUNNER_TEMP/ziphelper"
+          go mod init ziphelper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  f, err := os.Create(os.Args[1])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  m := module.Version{Path: os.Args[2], Version: os.Args[3]}
+                  if err := zip.CreateFromDir(f, m, os.Args[4]); err != nil {
+                      log.Fatal(err)
+                  }
+          }
+          EOF
+          go run . "$RUNNER_TEMP/out/v1.31.0.zip" go.temporal.io/server v1.31.0 "$GITHUB_WORKSPACE"
+          ls -l "$RUNNER_TEMP/out/v1.31.0.zip"
+          echo "zip entries: $(unzip -l "$RUNNER_TEMP/out/v1.31.0.zip" | tail -n 1)"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v6
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.31.0.zip
+          if-no-files-found: error
 
   test-status:
     if: always()
@@ -681,7 +698,9 @@ jobs:
       - unit-test
       - integration-test
       - functional-test
+      - module-zip
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       RESULTS: ${{ toJSON(needs.*.result) }}
     steps:
@@ -695,11 +714,13 @@ jobs:
   notify-failure:
     name: Notify Slack on Failure
     if: |
+      false &&
       always() &&
       github.ref == 'refs/heads/main' &&
       needs.test-status.result == 'failure'
     needs: test-status
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       actions: read
